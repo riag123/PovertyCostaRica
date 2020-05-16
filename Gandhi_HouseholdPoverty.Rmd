@@ -1,0 +1,1296 @@
+---
+title: "Predicting Household Poverty Level"
+author:
+- Ria Gandhi
+- Ammar Lone
+- Emma Jang
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r}
+library(tidyverse)
+library(randomForest)
+library(corrplot)
+library(tibble)
+library(stringr)
+library(RColorBrewer)
+library(data.table)
+library(dplyr)
+library(gridExtra)
+library(reshape2)
+library(glmnet)
+library(xtable)
+library(pROC)
+library(lubridate)
+library(rpart)
+library(car)
+library(tree)
+library(partykit)
+library(caret)
+```
+
+```{r}
+train = read.csv("~/Downloads/STAT 471/Final Project/train_features.csv")
+train_labels = read.csv("~/Downloads/STAT 471/Final Project/train_labels.csv")
+
+#Add response variable to training set
+train = left_join(train, train_labels, by = "household")
+
+#Checking that every individual in the household has the same Target. The data is fine.
+temp = train %>% group_by(household) %>% summarise(n_distinct(Target))
+
+train$parentesco1.y = NULL
+train$Id.y = NULL
+colnames(train)[2] = "Id"
+colnames(train)[which(names(train) == "parentesco1.x")] = "parentesco1"
+
+df = train
+
+#Clean up environment
+rm(temp, train_labels)
+```
+
+Check datatypes
+```{r}
+d_types = as.data.frame(sapply(df, class))
+d_types = cbind(colnames(df), d_types)
+colnames(d_types)[1] = "column"
+colnames(d_types)[2] = "type"
+
+#These are integer columns - they will not need to be aggregated
+int = d_types %>% filter(type == "integer") 
+int
+
+#These are float columns - these are continuous variables
+float = d_types %>% filter(type == "numeric") 
+float
+
+#These are factor columns
+factor = d_types %>% filter(type == "factor") 
+factor
+```
+
+Factor Columns
+```{r}
+#Factor columns in this dataset have a mix of strings and numbers - mapping below is based on data documentation
+#Household, Id.x, idhogar, Id.y are identifying variables, so do not need to be converted
+
+#Dependency rate (ratio of dependents in household)
+df$dependency = ifelse(df$dependency == "yes", 1.0, 0.0)
+
+#Education for male head of household
+df$edjefe = ifelse(df$edjefe == "yes", 1.0, 0.0)
+
+#Education for female head of household
+df$edjefa = ifelse(df$edjefa == "yes", 1.0, 0.0)
+```
+
+```{r}
+#Dealing with NAs
+colnames(df)[colSums(is.na(df)) > 0]
+```
+
+```{r, results = "hide"}
+#v2a1 is the monthly rent payment. The tipovivi columns indicate the level of homeownership. Given that almost the same amount of homes that are owned and paid off (tipovivi1 == 1) are NA in v2a1, we will replace all NAs in v2a1 with 0.
+sum(is.na(df$v2a1[df$tipovivi1 == 1])) #4714
+df$v2a1[is.na(df$v2a1)] = 0
+
+#v18q1 is number of tablets the household owns. v18q is a column indicating whether or not household owns a tablet. Examining the data, we see that v18q1 is NA when v18q = 0, so we replace NAs with 0
+tablets = df %>% select(c(v18q, v18q1)) %>% group_by(v18q) %>% summarise(v18q1_NAs = sum(is.na(v18q1))) 
+df$v18q1[is.na(df$v18q1)] = 0
+
+#rez_esc is the number of years behind in school. Data documentation indicates that variable is only for people of school age (7-19 years old). Therefore, we set NAs for people outside this range to 0. The rest of the missing values will be replaced with the median.
+df$rez_esc[((df$age < 7) | (df$age > 19)) & is.na(df$rez_esc == TRUE)] = 0.0
+df$rez_esc[is.na(df$rez_esc)] = 0.0 #0 is the median
+
+#mean_educ only has 5 NAs. We replace them with the median
+df$meaneduc[is.na(df$meaneduc)] = 9.0 #9 is the median
+
+#SQBmeaned will be removed because of collinearity
+df$SQBmeaned = NULL
+```
+
+Additional Cleaning
+```{r}
+#Remove all squared variables for collinearity
+df = df %>% select(-contains("SQ"))
+df = df %>% select(-contains("sq"))
+
+#Remove elimbasu5 - there is nothing in the column
+df$elimbasu5 = NULL
+
+#Manually sort variables
+id = c("Id", "idhogar", "Target")
+
+ind_bool = c("v18q", "dis", "male", "female", "estadocivil1", "estadocivil2", "estadocivil3", "estadocivil4", "estadocivil5", "estadocivil6", "estadocivil7", "parentesco1", "parentesco2",  "parentesco3", "parentesco4", "parentesco5", "parentesco6", "parentesco7", "parentesco8",  "parentesco9", "parentesco10", "parentesco11", "parentesco12", "instlevel1", "instlevel2", "instlevel3", "instlevel4", "instlevel5", "instlevel6", "instlevel7", "instlevel8", "instlevel9", "mobilephone")
+ind_ordered = c("rez_esc", "escolari", "age")
+
+house_bool = c("hacdor", "hacapo", "v14a", "refrig", "paredblolad", "paredzocalo", 
+           "paredpreb","pisocemento", "pareddes", "paredmad",
+           "paredzinc", "paredfibras", "paredother", "pisomoscer", "pisoother", 
+           "pisonatur", "pisonotiene", "pisomadera",
+           "techozinc", "techoentrepiso", "techocane", "techootro", "cielorazo", 
+           "abastaguadentro", "abastaguafuera", "abastaguano",
+            "public", "planpri", "noelec", "coopele", "sanitario1", 
+           "sanitario2", "sanitario3", "sanitario5",   "sanitario6",
+           "energcocinar1", "energcocinar2", "energcocinar3", "energcocinar4", 
+           "elimbasu1", "elimbasu2", "elimbasu3", "elimbasu4", 
+           "elimbasu6", "epared1", "epared2", "epared3",
+           "etecho1", "etecho2", "etecho3", "eviv1", "eviv2", "eviv3", 
+           "tipovivi1", "tipovivi2", "tipovivi3", "tipovivi4", "tipovivi5", 
+           "computer", "television", "lugar1", "lugar2", "lugar3",
+           "lugar4", "lugar5", "lugar6", "area1", "area2")
+
+house_ordered = c("rooms", "r4h1", "r4h2", "r4h3", "r4m1","r4m2","r4m3", "r4t1",  "r4t2", 
+              "r4t3", "v18q1", "tamhog","tamviv","hhsize","hogar_nin",
+              "hogar_adul","hogar_mayor","hogar_total",  "bedrooms", "qmobilephone")
+
+house_float = c("v2a1", "dependency", "edjefe", "edjefa", "meaneduc", "overcrowding")
+```
+
+
+Electricity Variable
+```{r}
+#public and coopele are very correlated, they are 2 of the 4 electricity variables: noelec, coopele, public, planpri
+df$elec = NA
+for (i in 1:nrow(df)){
+  if(df$noelec[i] == 1){
+    df$elec[i] = 0
+  } else if (df$coopele[i] == 1){
+    df$elec[i] = 1
+  } else if (df$public[i] == 1){
+    df$elec[i] = 2
+  } else {
+    df$elec[i] = 3
+  }
+}
+df$noelec = NULL
+df$coopele = NULL
+df$public = NULL
+df$planpri = NULL
+```
+
+Walls Variable
+```{r}
+#wall quality is split into multiple columns. We make it an ordinal variable
+df$walls = NA
+for (i in 1:nrow(df)){
+  if(df$epared1[i] == 1){
+    df$walls[i] = 0
+  } else if (df$epared2[i] == 1){
+    df$walls[i] = 1
+  } else {
+    df$walls[i] = 2
+  }
+}
+df$epared1 = NULL
+df$epared2 = NULL
+df$epared3 = NULL
+```
+
+Roof Variable
+```{r}
+#roof quality is split into multiple columns. We make it an ordinal variable
+df$roof = NA
+for (i in 1:nrow(df)){
+  if(df$etecho1[i] == 1){
+    df$roof[i] = 0
+  } else if (df$etecho2[i] == 1){
+    df$roof[i] = 1
+  } else {
+    df$roof[i] = 2
+  }
+}
+df$etecho1 = NULL
+df$etecho2 = NULL
+df$etecho3 = NULL
+```
+
+Floor Variable
+```{r}
+#floor quality is split into multiple columns. We make it an ordinal variable
+df$floors = NA
+for (i in 1:nrow(df)){
+  if(df$eviv1[i] == 1){
+    df$floors[i] = 0
+  } else if (df$eviv2[i] == 1){
+    df$floors[i] = 1
+  } else {
+    df$floors[i] = 2
+  }
+}
+
+df$eviv1 = NULL
+df$eviv2 = NULL
+df$eviv3 = NULL
+```
+
+Overall Condition Variable
+```{r}
+#rates the overall condition of the house. Negative if no toilet, no floor, no water service, no source of energy
+df$condition = NA
+for (i in 1:nrow(df)){
+  df$condition[i] = -1 * (df$sanitario1[i] + df$pisonotiene[i] + df$abastaguano[i] + df$energcocinar1[i] + as.numeric(df$cielorazo[i] == 0))
+ }
+
+df$sanitario1 = NULL
+df$pisonotiene = NULL
+df$abastaguano = NULL
+df$energcocinar1 = NULL
+df$cielorazo = NULL
+```
+
+Technology Variable
+```{r}
+#rates the overall extra, discretionary items a family owns, focusing on technology. More positive = more technology
+df$tech = NA
+for (i in 1:nrow(df)){
+  df$tech[i] = 1 * (df$refrig[i] + df$computer[i] + df$v18q1[i] + df$television[i] + df$mobilephone[i])
+  }
+
+df$refrig = NULL
+df$computer = NULL
+df$qmobilephone = NULL
+df$v18q1 = NULL
+df$television = NULL
+```
+
+Standardize objects to number of people in house
+```{r}
+df$rooms = df$rooms / df$hhsize
+df$rent = df$v2a1 / df$rooms
+
+df$rooms = NULL
+df$v2a1 = NULL
+```
+
+###Dealing with Individual Variables
+
+```{r}
+df$male = NULL #collinear with female
+df$r4t1 = NULL #collinear with split of males and females under 12
+df$r4t2 = NULL #collinear with split of males and females over 12
+df$r4t3 = NULL #collinear with split of total people in the house
+df$r4h3 = NULL #collinear with split of males in the house
+df$r4m3 = NULL #collinear with split of females in the house
+df$hacdor = NULL #collinear with overcrowding
+df$hacapo = NULL #collinear with overcrowding
+
+#inst - levels of education
+df$inst = NA
+for (i in 1:nrow(df)){
+  if(df$instlevel1[i] == 1){
+    df$inst[i] = 1
+  } else if (df$instlevel2[i] == 1){
+    df$inst[i] = 2
+  } else if (df$instlevel3[i] == 1){
+    df$inst[i] = 3
+  } else if (df$instlevel4[i] == 1){
+    df$inst[i] = 4
+  } else if (df$instlevel5[i] == 1){
+    df$inst[i] = 5
+  } else if (df$instlevel6[i] == 1){
+    df$inst[i] = 6
+  } else if (df$instlevel7[i] == 1){
+    df$inst[i] = 7
+  } else if (df$instlevel8[i] == 1){
+    df$inst[i] = 8
+  } else {
+    df$inst[i] = 9
+  }
+}
+
+df$instlevel1 = NULL
+df$instlevel2 = NULL
+df$instlevel3 = NULL
+df$instlevel4 = NULL
+df$instlevel5 = NULL
+df$instlevel6 = NULL
+df$instlevel7 = NULL
+df$instlevel8 = NULL
+df$instlevel9 = NULL
+```
+
+
+Material
+```{r}
+df$pared = NA
+for (i in 1:nrow(df)){
+  if(df$paredother[i] == 1){
+    df$pared[i] = 1
+  } else if (df$pareddes[i] == 1){
+    df$pared[i] = 2
+  } else if (df$paredfibras[i] == 1){
+    df$pared[i] = 3
+  } else if (df$paredzocalo[i] == 1){
+    df$pared[i] = 4
+  } else if (df$paredzinc[i] == 1){
+    df$pared[i] = 5
+  } else if (df$paredmad[i] == 1){
+    df$pared[i] = 6
+  } else if (df$paredpreb[i] == 1){
+    df$pared[i] = 7
+  } else { 
+    df$pared[i] = 8 #paredblolad which is best material
+  }
+}
+
+df$paredother = NULL
+df$pareddes = NULL
+df$paredfibras = NULL
+df$paredzocalo = NULL
+df$paredzinc = NULL
+df$paredmad = NULL
+df$paredpreb = NULL
+df$paredblolad = NULL
+
+
+df$piso = NA
+for (i in 1:nrow(df)){
+  if(df$pisoother[i] == 1){
+    df$piso[i] = 1
+  } else if (df$pisonatur[i] == 1){
+    df$piso[i] = 2
+  } else if (df$pisomoscer[i] == 1){
+    df$piso[i] = 3
+  } else if (df$pisomadera[i] == 1){
+    df$piso[i] = 4
+  } else {
+    df$piso[i] = 5 #pisocemento which is the best
+  } 
+}
+
+df$pisoother = NULL
+df$pisonatur = NULL
+df$pisomoscer = NULL
+df$pisomadera = NULL
+df$pisocemento = NULL
+
+
+df$techo = NA
+for (i in 1:nrow(df)){
+  if(df$techootro[i] == 1){
+    df$techo[i] = 1
+  } else if (df$techocane[i] == 1){
+    df$techo[i] = 2
+  } else if (df$techozinc[i] == 1){
+    df$techo[i] = 3
+  } else {
+    df$techo[i] = 4 #techoentrepiso which is the best
+  } 
+}
+
+df$techootro = NULL
+df$techocane = NULL
+df$techozinc = NULL
+df$techoentrepiso = NULL
+```
+
+Water/Toilet
+```{r}
+df$abasta = NA
+for (i in 1:nrow(df)){
+  if(df$abastaguafuera[i] == 1){
+    df$abasta[i] = 0
+  } else {
+    df$abasta[i] = 1 #abastaguadentro means there is water inside dwelling
+  } 
+}
+
+df$abastaguadentro = NULL
+df$abastaguafuera = NULL
+
+df$sanitario = NA
+for (i in 1:nrow(df)){
+  if(df$sanitario6[i] == 1){
+    df$sanitario[i] = 1
+  } else if (df$sanitario5[i] == 1){
+    df$sanitario[i] = 2
+  } else if (df$sanitario3[i] == 1){
+    df$sanitario[i] = 3
+  } else {
+    df$sanitario[i] = 4 #sanitario2 which is the best
+  } 
+}
+
+df$sanitario2 = NULL
+df$sanitario3 = NULL
+df$sanitario5 = NULL
+df$sanitario6 = NULL
+
+
+df$energcocinar = NA
+for (i in 1:nrow(df)){
+  if(df$energcocinar4[i] == 1){
+    df$energcocinar[i] = 1
+  } else if (df$energcocinar3[i] == 1){
+    df$energcocinar[i] = 2
+  } else {
+    df$energcocinar[i] = 3 #energcocinar2 which is the best
+  } 
+}
+
+df$energcocinar2 = NULL
+df$energcocinar3 = NULL
+df$energcocinar4 = NULL
+
+
+df$elimbasu = NA
+for (i in 1:nrow(df)){
+  if(df$elimbasu6[i] == 1){
+    df$elimbasu[i] = 1
+  } else if (df$elimbasu4[i] == 1){
+    df$elimbasu[i] = 2
+  } else if (df$elimbasu3[i] == 1){
+    df$elimbasu[i] = 3
+  } else if (df$elimbasu2[i] == 1){
+    df$elimbasu[i] = 4
+  } else {
+    df$elimbasu[i] = 5 #elimbasu1 which is the best
+  } 
+}
+
+df$elimbasu1 = NULL
+df$elimbasu2 = NULL
+df$elimbasu3 = NULL
+df$elimbasu4 = NULL
+df$elimbasu6 = NULL
+```
+
+Place
+```{r}
+df$lugar = NA
+for (i in 1:nrow(df)){
+  if(df$lugar1[i] == 1){
+    df$lugar[i] = 1
+  } else if (df$lugar2[i] == 1){
+    df$lugar[i] = 2
+  } else if (df$lugar3[i] == 1){
+    df$lugar[i] = 3
+  } else if (df$lugar4[i] == 1){
+    df$lugar[i] = 4
+  } else if (df$lugar5[i] == 1){
+    df$lugar[i] = 5 
+  } else {
+    df$lugar[i] = 6
+  }
+}
+
+df$lugar1 = NULL
+df$lugar2 = NULL
+df$lugar3 = NULL
+df$lugar4 = NULL
+df$lugar5 = NULL
+df$lugar6 = NULL
+
+df$area = NA
+for (i in 1:nrow(df)){
+  if(df$area1[i] == 1){
+    df$area[i] = 1
+  } else {
+    df$area[i] = 2 
+  }
+}
+
+df$area1 = NULL
+df$area2 = NULL
+
+
+df$tipovivi = NA
+for (i in 1:nrow(df)){
+  if(df$tipovivi4[i] == 1){
+    df$tipovivi[i] = 1
+  } else if (df$tipovivi5[i] == 1){
+    df$tipovivi[i] = 2
+  } else if (df$tipovivi3[i] == 1){
+    df$tipovivi[i] = 3
+  } else if (df$tipovivi2[i] == 1){
+    df$tipovivi[i] = 4
+  } else {
+    df$tipovivi[i] = 5 #tipovivi1 which is best
+  } 
+}
+
+df$tipovivi1 = NULL
+df$tipovivi2 = NULL
+df$tipovivi3 = NULL
+df$tipovivi4 = NULL
+df$tipovivi5 = NULL
+
+
+df$estadocivil1 = NULL #age-related, so collinear
+df$parentesco2 = NULL
+df$parentesco3 = NULL
+df$parentesco4 = NULL
+df$parentesco5 = NULL
+df$parentesco6 = NULL
+df$parentesco7 = NULL
+df$parentesco8 = NULL
+df$parentesco9 = NULL
+df$parentesco10 = NULL
+df$parentesco11 = NULL
+df$parentesco12 = NULL
+```
+
+###Aggregate by Household
+
+```{r}
+household_aggregates = df %>%
+  group_by(household) %>%
+  summarise(v14a = mean(v14a),
+            v18q = as.factor(mean(v18q)),
+            r4h1 = mean(r4h1),
+            r4h2 = mean(r4h2),
+            r4m1 = mean(r4m1),
+            r4m2 = mean(r4m2),
+            rez_esc = mean(rez_esc),
+            hhsize = mean(hhsize),
+            dis = as.factor(sum(dis)),
+            female = sum(female),
+            estadocivil2 = as.factor(max(estadocivil2)),
+            estadocivil3 = as.factor(max(estadocivil3)),
+            estadocivil4 = as.factor(max(estadocivil4)),
+            estadocivil5 = as.factor(max(estadocivil5)),
+            estadocivil6 = as.factor(max(estadocivil6)),
+            estadocivil7 = as.factor(max(estadocivil7)),
+            hogar_nin = mean(hogar_nin),
+            hogar_adul= mean(hogar_adul),
+            hogar_mayor = mean(hogar_mayor),
+            dependency = as.factor(mean(dependency)),
+            edjefe = as.factor(mean(edjefe)),
+            edjefa = as.factor(mean(edjefa)),
+            meaneduc = mean(meaneduc),
+            bedrooms = mean(bedrooms), 
+            overcrowding = mean(overcrowding),
+            tipovivi = as.factor(mean(tipovivi)),
+            age_max = max(age),
+            age_min = min(age),
+            elec = as.factor(mean(elec)),
+            walls = as.factor(mean(walls)),
+            roof = as.factor(mean(roof)),
+            floors = as.factor(mean(floors)),
+            condition = as.factor(mean(condition)),
+            tech = as.factor(mean(tech)),
+            rent = mean(rent),
+            inst_max = as.factor(max(inst)),
+            inst_min = as.factor(min(inst)),
+            escolari = mean(escolari),
+            area = mean(area),
+            inst_head = as.factor(inst[parentesco1 == 1]), #education of head of household
+            pared = as.factor(mean(pared)),
+            piso = as.factor(mean(piso)),
+            lugar = as.factor(max(lugar)),
+            mobilephone = sum(mobilephone),
+            Target = as.factor(mean(Target))
+  )
+```
+
+The dataset is very imbalanced. This problem could be tackled through oversampling, but for now, we will leave that technique out of this project due to time constraints.
+```{r}
+ggplot(household_aggregates, aes(factor(Target, level = c('1', '2', '3', '4')))) + geom_histogram(stat = "count", binwidth = 0.5, fill = "lightblue") + theme_bw() + labs(x="Poverty Level", y = "Number of Households", title = "Number of Households at each Poverty Level") 
+```
+
+```{r}
+head <- household_aggregates
+head$household <- NULL
+head$v18q <- as.numeric(head$v18q)
+head$estadocivil2 <- as.numeric(head$estadocivil2)
+head$dis <- as.numeric(head$dis)
+head$estadocivil3 <- as.numeric(head$estadocivil3)
+head$estadocivil4 <- as.numeric(head$estadocivil4)
+head$estadocivil5 <- as.numeric(head$estadocivil5)
+head$estadocivil6 <- as.numeric(head$estadocivil6)
+head$estadocivil7 <- as.numeric(head$estadocivil7)
+head$dependency <- as.numeric(head$dependency)
+head$edjefa <- as.numeric(head$edjefa)
+head$edjefe <- as.numeric(head$edjefe)
+head$elec <- as.numeric(head$elec)
+head$walls <- as.numeric(head$walls)
+head$tech <- as.numeric(head$tech)
+head$roof <- as.numeric(head$roof)
+head$floors <- as.numeric(head$floors)
+head$tipovivi <- as.numeric(head$tipovivi)
+head$condition <- as.numeric(head$condition)
+head$inst_head <- as.numeric(head$inst_head)
+head$inst_max <- as.numeric(head$inst_max)
+head$inst_min <- as.numeric(head$inst_min)
+head$pared <- as.numeric(head$pared)
+head$piso <- as.numeric(head$piso)
+head$lugar <- as.numeric(head$lugar)
+head$Target <- as.numeric(head$Target)
+```
+
+```{r}
+# Compute and plot correlations
+cor_matrix <- round(cor(head),2)
+cor_matrix <- melt(cor_matrix)
+```
+
+```{r}
+cor_plot <- ggplot(data = cor_matrix, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab",) +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 90, vjust = 1, 
+    size = 7, hjust = 1)) +
+   theme(axis.text.y = element_text(angle = 0, vjust = 1, 
+    size = 7, hjust = 1)) + labs(fill='Correlation') +
+ coord_fixed() 
+ cor_plot
+```
+
+```{r}
+cor_matrix_correlated <- cor_matrix
+cor_matrix_correlated <- filter(cor_matrix_correlated, value != 1)
+cor_matrix_correlated <- filter(cor_matrix_correlated, value > .5 | value < - .5)
+cor_matrix_correlated
+```
+
+We will use binary classification for this project.
+```{r, warning=FALSE, message=FALSE}
+household_aggregates$Target <-as.numeric(household_aggregates$Target)
+household_aggregates$Target[household_aggregates$Target<=2] <- 1
+household_aggregates$Target[household_aggregates$Target>=3] <- 0
+household_aggregates$Target <-as.factor(household_aggregates$Target)
+```
+
+```{r, warning=FALSE, message=FALSE}
+one_graph <- household_aggregates[household_aggregates$Target == 1, ]
+two_graph <- household_aggregates[household_aggregates$Target == 0, ]
+```
+
+```{r}
+one_graph$overcrowding <- ceiling(one_graph$overcrowding)
+two_graph$overcrowding <- ceiling(two_graph$overcrowding)
+```
+
+```{r, warning=FALSE, message=FALSE}
+poverty_hsize1 <- ggplot(one_graph, aes(fill = 'lightblue', x = hhsize, y = ((..count..)/sum(..count..)))) +
+    geom_bar() + scale_fill_manual(values = c("lightblue")) +
+  xlab("Household Size") +
+  ylab("Count") +
+  ggtitle("Impoverished Household Size Distribution") +
+  scale_y_continuous(name = "Percentage",limits=c(0, .3)) + theme_bw() + theme(legend.position = "none") + theme(plot.title = element_text(size = 8, family = "Tahoma", face = "bold"))
+```
+
+```{r, warning=FALSE, message=FALSE}
+poverty_hsize2 <- ggplot(two_graph, aes(fill = 'lightblue', x = hhsize, y = ((..count..)/sum(..count..)))) + scale_fill_manual(values = c("lightblue")) +
+    geom_bar() +
+  xlab("Household Size") +
+  ylab("Count") +
+  ggtitle("Non-Vulnerable Household Size Distribution") +
+  scale_y_continuous(name = "Percentage",limits=c(0, .3)) + theme_bw() + theme(legend.position = "none") + theme(plot.title = element_text(size = 8, family = "Tahoma", face = "bold"))
+```
+
+```{r, warning=FALSE, message=FALSE}
+grid.arrange(poverty_hsize1, poverty_hsize2, ncol=2)
+```
+
+```{r}
+poverty_tech1 <- ggplot(one_graph, aes(fill = "lightblue", x = factor(tech, level = c('0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11')), y = ((..count..)/sum(..count..)))) +
+    geom_bar() +
+  xlab("Tech Level") +
+  ylab("Count") +
+  ggtitle("Tech Level of Impoverished Households") +
+  scale_y_continuous(name = "Percentage",limits=c(0, 0.7)) + theme_bw() + theme(legend.position = "none") + theme(plot.title = element_text(size = 8, family = "Tahoma", face = "bold")) + scale_fill_manual(values = c("lightblue"))
+```
+
+```{r}
+poverty_tech2 <- ggplot(two_graph, aes(x = factor(tech, level = c('0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16')), y = ((..count..)/sum(..count..)), fill = 'lightblue')) +
+    geom_bar() +
+  xlab("Tech Level") +
+  ylab("Count") +
+  ggtitle("Tech Level of Non-Vulnerable Households") +
+  scale_y_continuous(name = "Percentage",limits=c(0, .7)) + theme_bw() + theme(legend.position = "none") + theme(plot.title = element_text(size = 8, family = "Tahoma", face = "bold")) + scale_fill_manual(values = c("lightblue"))
+```
+
+
+```{r}
+poverty_condition1 <- ggplot(one_graph, aes(fill = "lightblue", x = factor(condition, level = c('-5', '-4', '-3', '-2', '-1', '0')), y = ((..count..)/sum(..count..)))) +
+    geom_bar() +
+  xlab("Condition") +
+  ylab("Count") +
+  ggtitle("House Condition of Impoverished Households")  +
+  scale_y_continuous(name = "Percentage",limits=c(0, .7)) + theme_bw() + theme(legend.position = "none") + theme(plot.title = element_text(size = 8, family = "Tahoma", face = "bold")) + scale_fill_manual(values = c("lightblue"))
+```
+
+```{r}
+poverty_condition2 <- ggplot(two_graph, aes(x = factor(condition, level = c('-5', '-4', '-3', '-2', '-1', '0')), y = ((..count..)/sum(..count..)), fill = 'lightblue')) +
+    geom_bar() +
+  xlab("Condition") +
+  ylab("Count") +
+  ggtitle("House Condition of Non-Vulnerable Households") + theme_bw() + theme(legend.position = "none") + theme(plot.title = element_text(size = 8, family = "Tahoma", face = "bold")) + scale_fill_manual(values = c("lightblue"))
+```
+
+```{r}
+poverty_overcrowd1 <- ggplot(one_graph, aes(x = factor(overcrowding, level = c('0', '1', '2', '3', '4', '5', '6')), y = ((..count..)/sum(..count..)), fill = 'lightblue')) +
+    geom_bar() +
+  xlab("Overcrowding Level") +
+  ylab("Count") +
+  ggtitle("Overcrowding of Impoverished Households")  +
+  scale_y_continuous(name = "Percentage",limits=c(0, .6)) + theme_bw() + theme(legend.position = "none") + theme(plot.title = element_text(size = 8, family = "Tahoma", face = "bold")) + scale_fill_manual(values = c("lightblue"))
+```
+
+```{r}
+poverty_overcrowd2 <- ggplot(two_graph, aes(x = factor(overcrowding, level = c('0', '1', '2', '3', '4', '5', '6')), y = ((..count..)/sum(..count..)), fill = 'lightblue')) +
+    geom_bar() +
+  xlab("Overcrowding Level") +
+  ylab("Count") +
+  ggtitle("Overcrowding of Non-Vulnerable Households")  +
+  scale_y_continuous(name = "Percentage",limits=c(0, .6)) + theme_bw() + theme(legend.position = "none") + theme(plot.title = element_text(size = 8, family = "Tahoma", face = "bold")) + scale_fill_manual(values = c("lightblue"))
+```
+
+```{r}
+grid.arrange(poverty_overcrowd1, poverty_overcrowd2,poverty_condition1, poverty_condition2, poverty_tech1, poverty_tech2, ncol=2)
+```
+
+```{r}
+one_graph$inst_head <- as.numeric(one_graph$inst_head)
+one_graph$inst_head[one_graph$inst_head == 1] <- "No Level of Education"
+one_graph$inst_head[one_graph$inst_head == 2] <- "Incomplete Primary"
+one_graph$inst_head[one_graph$inst_head == 3] <- "Complete Primary"
+one_graph$inst_head[one_graph$inst_head == 4] <- "Incomplete Academic Secondary Level"
+one_graph$inst_head[one_graph$inst_head == 5] <- "Complete Academic Secondary Level"
+one_graph$inst_head[one_graph$inst_head == 6] <- "Incomplete Technical Secondary Level"
+one_graph$inst_head[one_graph$inst_head == 7] <- "Complete Technical Secondary Level"
+one_graph$inst_head[one_graph$inst_head == 8] <- "Undergraduate and Higher Education"
+one_graph$inst_head[one_graph$inst_head == 9] <- "Post Graduate Higher Education"
+```
+
+
+```{r}
+two_graph$inst_head <- as.numeric(two_graph$inst_head)
+two_graph$inst_head[two_graph$inst_head == 1] <- "No Level of Education"
+two_graph$inst_head[two_graph$inst_head == 2] <- "Incomplete Primary"
+two_graph$inst_head[two_graph$inst_head == 3] <- "Complete Primary"
+two_graph$inst_head[two_graph$inst_head == 4] <- "Incomplete Academic Secondary Level"
+two_graph$inst_head[two_graph$inst_head == 5] <- "Complete Academic Secondary Level"
+two_graph$inst_head[two_graph$inst_head == 6] <- "Incomplete Technical Secondary Level"
+two_graph$inst_head[two_graph$inst_head == 7] <- "Complete Technical Secondary Level"
+two_graph$inst_head[two_graph$inst_head == 8] <- "Undergraduate and Higher Education"
+two_graph$inst_head[two_graph$inst_head == 9] <- "Post Graduate Higher Education"
+```
+
+```{r}
+head_education_1 <- one_graph %>% group_by(inst_head) 
+head_education_1 <- summarise(head_education_1, count=n())
+head_education_1$percentage <- head_education_1$count/nrow(one_graph)
+
+head_education_2 <- two_graph %>% group_by(inst_head)
+head_education_2 <- summarize(head_education_2, count=n())
+head_education_2$percentage <- head_education_2$count/nrow(two_graph)
+```
+
+
+```{r}
+poverty_educ1 <- ggplot(head_education_1, aes(x=factor(inst_head, level = c("No Level of Education", "Incomplete Primary", "Complete Primary", "Incomplete Academic Secondary Level", "Complete Academic Secondary Level", "Incomplete Technical Secondary Level", "Complete Technical Secondary Level", "Undergraduate and Higher Education", "Post Graduate Higher Education")), y=percentage)) + 
+  geom_bar(stat="identity", fill = "lightblue") +
+  xlab("Education Level")  + theme_bw() +
+  ggtitle("Education Level of Impoverished Households") + 
+  scale_y_continuous(name = "Percentage",limits=c(0, .35)) + 
+  theme(plot.title = element_text(size = 9, face = "bold")) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 5), axis.title.x = element_text(size=7), axis.title.y = element_text(size=7)) + theme(legend.position = "none") + scale_fill_manual(values = c("lightblue"))
+```
+
+
+```{r}
+poverty_educ2 <- ggplot(head_education_2, aes(x=factor(inst_head, level = c("No Level of Education", "Incomplete Primary", "Complete Primary", "Incomplete Academic Secondary Level", "Complete Academic Secondary Level", "Incomplete Technical Secondary Level", "Complete Technical Secondary Level", "Undergraduate and Higher Education", "Post Graduate Higher Education")), y=percentage)) + 
+  geom_bar(stat="identity", fill="lightblue") +
+  theme_bw() +
+  xlab("Education Level")  + 
+  ggtitle("Education Level of Non-Vulnerable Households") + 
+  theme(plot.title = element_text(size = 9, face = "bold")) +
+  scale_y_continuous(name = "Percentage",limits=c(0, .35)) + 
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 5), axis.title.x = element_text(size=7), axis.title.y = element_text(size=7)) + theme(legend.position = "none") + scale_fill_manual(values = c("lightblue"))
+```
+
+```{r}
+grid.arrange(poverty_educ1, poverty_educ2, ncol=2)
+```
+
+
+```{r}
+one_graph$area <- as.numeric(one_graph$area)
+two_graph$area <- as.numeric(two_graph$area)
+one_graph$area[one_graph$area == 1] <- "Urban"
+one_graph$area[one_graph$area == 2] <- "Rural"
+two_graph$area[two_graph$area == 1] <- "Urban"
+two_graph$area[two_graph$area == 2] <- "Rural"
+```
+
+```{r}
+area_1 <- one_graph %>% group_by(area)
+area_1 <- summarize(area_1, count=n())
+area_1$percentage = area_1$count 
+area_1$percentage <- area_1$count/nrow(one_graph)
+
+area_2 <- two_graph %>% group_by(area)
+area_2 <- summarize(area_2, count=n())
+area_2$percentage <- area_2$count/nrow(two_graph)
+```
+
+```{r}
+area_plot1 <- ggplot(area_1, aes(x=area, y=percentage)) + 
+  geom_bar(stat="identity", fill="lightblue") +
+  theme_bw() +
+  xlab("Geographic Area")  + 
+  ggtitle("Urban-Rural Divide of Impoverished Households") + 
+    scale_y_continuous(name = "Percentage", limits=c(0, .8)) +
+    theme(plot.title = element_text(size = 9, face = "bold")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9), axis.title.x = element_text(size=9), axis.title.y = element_text(size=9))
+```
+
+```{r}
+area_plot2 <- ggplot(area_2, aes(x=area, y=percentage)) + 
+  geom_bar(stat="identity", fill="lightblue") +
+  theme_bw() +
+  theme_bw() +
+  xlab("Geographic Area")  + 
+  ggtitle("Urban-Rural Divide of Non-Vulnerable Households") + 
+    scale_y_continuous(name = "Percentage", limits=c(0, .8)) +
+    theme(plot.title = element_text(size = 9, face = "bold")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9), axis.title.x = element_text(size=9), axis.title.y = element_text(size=9))
+
+```
+
+```{r}
+grid.arrange(area_plot1, area_plot2, ncol=2)
+```
+
+
+```{r}
+grid.arrange(poverty_hsize1, poverty_hsize2, ncol=2)
+```
+
+```{r}
+#Remove the correlated household variables
+household_aggregates$r4h1 = NULL
+household_aggregates$r4h2 = NULL
+household_aggregates$r4m1 = NULL
+household_aggregates$r4m2 = NULL
+household_aggregates$escolari = NULL
+household_aggregates$v18q = NULL
+household_aggregates$rent = NULL
+household_aggregates$age_min = NULL
+household_aggregates$age_max = NULL
+household_aggregates$inst_min = NULL
+```
+
+Now that the data has been cleaned, separate back into train and test sets.
+```{r}
+train = household_aggregates
+```
+
+
+
+##Model Building
+
+Before we begin the Model Building, we have to separate the train data into a training and a testing dataset.
+
+```{r}
+n <-nrow(train)
+set.seed(123)
+train.index <-sample(n, n*3/4) # we use about 3/4 of the subjects as the training data
+training <- train[train.index,]
+testing <- train[-train.index, ]
+training$household = NULL
+testing$household = NULL
+```
+
+####Fit 1: LASSO
+
+```{r}
+set.seed(1)
+X <- model.matrix(Target~., data = training)[,-1]
+Y <- training$Target
+```
+
+```{r}
+fit.lasso <- cv.glmnet(X,Y, alpha = 1, nfolds = 10, family = "binomial")
+fit.lasso$cvm
+```
+
+```{r}
+plot(fit.lasso)
+```
+
+```{r}
+fit.lasso$lambda.1se
+```
+
+```{r}
+coef.1se <- coef(fit.lasso, s="lambda.1se") 
+coef.1se <- coef.1se[which(coef.1se !=0), ]
+coef.1se <- as.matrix(coef.1se)
+coef.1se
+```
+
+```{r}
+fit.lasso.0 <- glm(Target ~ dis + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + tipovivi + roof + floors + condition + tech + inst_max + inst_head + pared + piso + lugar, data = training, family = binomial)
+Anova(fit.lasso.0)
+```
+
+Since there are many variables that are not significant in the model built from lasso selection above, we will drop variables one by one until all ther predictors are significant at the 0.01 level.
+
+```{r}
+fit.lasso.1 <- glm(Target ~ dis + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + tipovivi + roof + floors + condition + tech + inst_max + inst_head + pared + lugar, data = training, family = binomial(logit))
+Anova(fit.lasso.1)
+```
+
+```{r}
+fit.lasso.2 <- glm(Target ~ dis + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + tipovivi + roof + floors + condition + tech + inst_head + pared + lugar, data = training, family = binomial(logit))
+Anova(fit.lasso.2)
+```
+
+```{r}
+fit.lasso.3 <- glm(Target ~ dis + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + tipovivi + roof + condition + tech + inst_head + pared + lugar, data = training, family = binomial(logit))
+Anova(fit.lasso.3)
+```
+
+```{r}
+fit.lasso.4 <- glm(Target ~ dis + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + roof + condition + tech + inst_head + pared + lugar, data = training, family = binomial(logit))
+Anova(fit.lasso.4)
+```
+
+```{r}
+fit.lasso.5 <- glm(Target ~ dis + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + roof + condition + tech + inst_head + lugar, data = training, family = binomial(logit))
+Anova(fit.lasso.5)
+```
+
+```{r}
+fit.lasso.6 <- glm(Target ~ dis + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + roof + condition + tech + inst_head, training, family = binomial(logit))
+Anova(fit.lasso.6)
+```
+
+```{r}
+fit.lasso.7 <- glm(Target ~ dis + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + roof + tech + inst_head, training, family = binomial(logit))
+Anova(fit.lasso.7)
+```
+
+```{r}
+fit1 <- glm(Target ~ hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + roof + tech + inst_head, training, family = binomial(logit))
+Anova(fit1)
+```
+
+\textbf{Anova shows all of the variables to be significant despite individual levels being insignificant, so we keep everything in the model.}
+
+####Fit 2: Elastic net
+
+```{r}
+set.seed(1)
+X <- model.matrix(Target~., data = training)[,-1]
+Y <- training$Target
+```
+
+```{r}
+elasticnet.fit <- cv.glmnet(X,Y, alpha = .90, nfolds = 10, family = "binomial")
+```
+
+```{r}
+plot(elasticnet.fit)
+```
+
+```{r}
+beta.final <- coef(elasticnet.fit, s = "lambda.1se")
+beta.final <- beta.final[which(beta.final !=0),]
+beta.final <- as.matrix(beta.final)
+rownames(beta.final)
+```
+
+```{r}
+fit.elastic.0 <- glm(Target ~ dis + estadocivil6 + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + tipovivi + roof + floors + condition + tech + inst_max + inst_head + pared + piso + lugar, data = training, family = binomial(logit))
+Anova(fit.elastic.0)
+```
+
+Since there are many variables that are not significant in the model built from elastic net above, we will drop variables one by one until all ther predictors are significant at the 0.01 level.
+
+```{r}
+fit.elastic.1 <- glm(Target ~ dis + estadocivil6 + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + tipovivi + roof + floors + condition + tech + inst_max + inst_head + pared + lugar, data = training, family = binomial(logit))
+Anova(fit.elastic.1)
+```
+
+```{r}
+fit.elastic.2 <- glm(Target ~ dis + estadocivil6 + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + roof + floors + condition + tech + inst_max + inst_head + pared + lugar, data = training, family = binomial(logit))
+Anova(fit.elastic.2)
+```
+
+```{r}
+fit.elastic.2 <- glm(Target ~ dis + estadocivil6 + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + roof + condition + tech + inst_max + inst_head + pared + lugar, data = training, family = binomial(logit))
+Anova(fit.elastic.2)
+```
+
+```{r}
+fit.elastic.3 <- glm(Target ~ dis + estadocivil6 + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + roof + tech + inst_max + inst_head + pared + lugar, data = training, family = binomial(logit))
+Anova(fit.elastic.3)
+```
+
+```{r}
+fit.elastic.4 <- glm(Target ~ dis + estadocivil6 + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + roof + tech + inst_head + pared + lugar, data = training, family = binomial(logit))
+Anova(fit.elastic.4)
+```
+
+```{r}
+fit.elastic.5 <- glm(Target ~ dis + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + roof + tech + inst_head + pared + lugar, data = training, family = binomial(logit))
+Anova(fit.elastic.5)
+```
+
+```{r}
+fit.elastic.6 <- glm(Target ~ dis + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + roof + tech + inst_head + lugar, data = training, family = binomial(logit))
+Anova(fit.elastic.6)
+```
+
+```{r}
+fit.elastic.7 <- glm(Target ~ dis + hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + roof + tech + inst_head, data = training, family = binomial(logit))
+Anova(fit.elastic.7)
+```
+
+```{r}
+fit2 <- glm(Target ~ hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + roof + tech + inst_head, data = training, family = binomial(logit))
+Anova(fit2)
+```
+
+```{r}
+summary(fit2)
+```
+
+From the results above, we can see that all of fit2's predictors are significant at the 0.01 level. 
+
+```{r}
+testing = subset(testing, tech !=9)
+fit1.fitted.test <- predict(fit1, testing, type="response") 
+fit2.fitted.test <- predict(fit2, testing, type="response")
+
+fit1.test.roc <- roc(testing$Target, fit1.fitted.test)
+fit2.test.roc <- roc(testing$Target, fit2.fitted.test)
+
+data.frame(fit1.fitted.test, fit2.fitted.test)[1:10, ]
+```
+
+```{r}
+plot(1-fit1.test.roc$specificities, fit1.test.roc$sensitivities, 
+     col="red", type="l", lwd=3,
+    xlab=paste("AUC(fit1.test) =",
+          round(pROC::auc(fit1.test.roc),4), 
+          " AUC(fit2.test) =", 
+          round(pROC::auc(fit2.test.roc),4)),
+    ylab="Sensitivities")
+lines(1-fit2.test.roc$specificities, fit2.test.roc$sensitivities, col="blue", lwd=3) 
+legend("bottomright", legend=c("fit1.test - LASSO", "fit2.test - Elastic Net"),
+lty=c(1,1), lwd=c(2,2), col=c("red", "blue")) 
+title("Comparison of two models using testing data")
+```
+
+
+####Fit 4: Decision Tree
+
+Classification tree using all predictors
+```{r}
+fit3.1 <- rpart(Target~., training, minsplit=1, cp=9e-3)
+plot(as.party(fit3.1), main="Tree Using All Predictors")
+```
+
+Classification tree using predictors from LASSO
+```{r}
+fit3.2 <- rpart(Target~hogar_nin + hogar_adul + hogar_mayor + dependency + meaneduc + roof + tech + inst_head, training, minsplit=5, cp=9e-3)
+plot(as.party(fit3.2), main="Tree Using LASSO Predictors")
+```
+
+
+####Fit 4: Random Forest
+
+```{r}
+fitrandom <- randomForest(Target~., training, mtry=6, ntree=500)
+plot(fitrandom) 
+```
+
+
+```{r}
+# Tune mtry given ntree=250
+rf.error.p <- 1:16
+for (p in 1:16) {
+  fitrandom <- randomForest(Target~., training, mtry=p, ntree=250) 
+  rf.error.p[p] <- fitrandom$err.rate[250] 
+}
+rf.error.p 
+
+plot(1:16, rf.error.p, pch=16, xlab="mtry",ylab="OOB mse of mtry") 
+lines(1:16, rf.error.p)
+```
+
+```{r}
+fit4 <- randomForest(Target~., training, mtry=4, ntree=250)
+```
+
+Testing Errors for all Models
+```{r}
+pred.1 = (predict(fit1, testing, type = "response") > 0.5)
+fit.1.bayes = as.factor(ifelse(pred.1 == "TRUE", "1", "0"))
+MCE.1.bayes = (sum(fit.1.bayes[testing$Target == "1"] != "1")
++ sum(fit.1.bayes[testing$Target == "0"] != "0"))/length(testing$Target)
+MCE.1.bayes
+
+fit.t1.bayes = (predict(fit3.1, testing, type = "class"))
+MCE.t1.bayes = (sum(fit.t1.bayes[testing$Target == "1"] != "1")
++ sum(fit.t1.bayes[testing$Target == "0"] != "0"))/length(testing$Target)
+MCE.t1.bayes
+
+fit.t1.2.bayes = (predict(fit3.2, testing, type = "class"))
+MCE.t1.2.bayes = (sum(fit.t1.2.bayes[testing$Target == "1"] != "1")
++ sum(fit.t1.2.bayes[testing$Target == "0"] != "0"))/length(testing$Target)
+MCE.t1.2.bayes
+
+fit.rf.bayes = (predict(fit4, testing, type = "class"))
+MCE.rf.bayes = (sum(fit.rf.bayes[testing$Target == "1"] != "1")
++ sum(fit.rf.bayes[testing$Target == "0"] != "0"))/length(testing$Target)
+MCE.rf.bayes
+```
+
+
+```{r}
+imp = as.data.frame(varImp(fit4))
+importance = imp[order(imp$Overall, decreasing = FALSE),]
+imp$varnames <- rownames(imp) # row names to column
+rownames(imp) <- NULL
+```
+
+```{r}
+#Feature Importance
+imp = as.data.frame(imp[order(imp$Overall, decreasing=TRUE),])
+m = mean(imp$Overall)
+to_plot = imp %>% filter(Overall > m)
+to_plot
+
+varImpPlot(fit4, sort = TRUE, n.var = 10, color = "blue", lcolor = "gray", main = "Random Forest Feature Importances") 
+
+```
+
+```{r}
+fit4preds <- predict(fit4, testing, type = "vote")
+fit4preds <- as.data.frame(fit4preds)
+rf.roc<-roc(testing$Target,fit4preds$`0`)
+plot(rf.roc, xlab=paste("AUC(fit4.test) =",
+          round(pROC::auc(rf.roc),4)))
+```
+
+```{r}
+final_cm = table(fit.rf.bayes, testing$Target)
+final_cm
+```
+
+```{r}
+# Precision
+p = final_cm[1,1]/sum(final_cm[1,1:2])
+p
+
+# Recall
+r = final_cm[1,1]/sum(final_cm[1:2,1])
+r
+
+#F1-score
+f = 2 * p * r / (p + r)
+f
+```
+
+
+## Appendix
+
+```{r}
+civil_1 <- one_graph %>% group_by(civil)
+civil_1 <- summarize(civil_1, count=n())
+civil_1$percentage = civil_1$count 
+civil_1$percentage <- civil_1$count/nrow(one_graph)
+
+civil_2 <- two_graph %>% group_by(civil)
+civil_2 <- summarize(civil_2, count=n())
+civil_2$percentage <- civil_2$count/nrow(two_graph)
+```
+
+```{r}
+lugar_1 <- one_graph %>% group_by(lugar)
+lugar_1 <- summarize(lugar_1, count=n())
+lugar_1$percentage = lugar_1$count 
+lugar_1$percentage <- lugar_1$count/nrow(one_graph)
+
+lugar_2 <- two_graph %>% group_by(lugar)
+lugar_2 <- summarize(lugar_2, count=n())
+lugar_2$percentage <- lugar_2$count/nrow(two_graph)
+```
+
+```{r}
+civil_plot1 <- ggplot(civil_1, aes(x=civil, y=percentage)) + 
+  geom_bar(stat="identity", fill="red") +
+  theme_bw() +
+  theme_bw() +
+  xlab("Relationship Status")  + 
+  ggtitle("Relationship Status of Impoverished") + 
+    theme(plot.title = element_text(size = 9, face = "bold")) +
+    scale_y_continuous(name = "Percentage", limits=c(0, .8)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9), axis.title.x = element_text(size=9), axis.title.y = element_text(size=9))
+civil_plot1
+```
+
+```{r}
+civil_plot2 <- ggplot(civil_2, aes(x=civil, y=percentage)) + 
+  geom_bar(stat="identity", fill="red") +
+  theme_bw() +
+  xlab("Relationship Status")  + 
+  ggtitle("Relationship Status of Non-Vulnerable") + 
+    theme(plot.title = element_text(size = 9, face = "bold")) +
+    scale_y_continuous(name = "Percentage", limits=c(0, .8)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9), axis.title.x = element_text(size=9), axis.title.y = element_text(size=9))
+civil_plot2
+```
+
+```{r}
+lugar_plot1 <- ggplot(lugar_1, aes(x=lugar, y=percentage)) + 
+  geom_bar(stat="identity", fill="red") +
+  theme_bw() +
+  xlab("Region")  + 
+  ggtitle("Regions of Impoverished") + 
+    scale_y_continuous(name = "Percentage", limits=c(0, .8)) +
+    theme(plot.title = element_text(size = 9, face = "bold")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9), axis.title.x = element_text(size=9), axis.title.y = element_text(size=9))
+lugar_plot1
+```
+
+```{r}
+lugar_plot2 <- ggplot(lugar_2, aes(x=lugar, y=percentage)) + 
+  geom_bar(stat="identity", fill="red") +
+  theme_bw() +
+  xlab("Region")  + 
+  ggtitle("Regions of Non-Vulnerable") + 
+    scale_y_continuous(name = "Percentage", limits=c(0, .8)) +
+    theme(plot.title = element_text(size = 9, face = "bold")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9), axis.title.x = element_text(size=9), axis.title.y = element_text(size=9))
+lugar_plot2
+```
+
+```{r}
+pca.poverty <- prcomp(training[, c(1:3, 5, 12:14, 18:20, 29, 34)], center = TRUE, scale.=TRUE)
+names(pca.poverty)
+pca.poverty$x
+
+pca.poverty.s <- summary(pca.poverty)
+pca.poverty.s 
+
+screeplot(pca.poverty) 
+
+
+plot(pca.poverty.s$importance[2,], col="red", pch=16, 
+xlab="PC's",
+ylab="PVE",
+main="Percentage of Variance Explained by PC's")
+# We can see that the leading two to three PC's capture the main variations in 
+# payrolls.
+
+
+# Exam bi-plot of PC1 and PC2
+biplot(pca.poverty, ylim=c(-.2, .2), xlim=c(-.2, .2)) 
+abline(v=0, h=0, lwd=3, col="blue")
+
+as.data.frame(pca.poverty$rotation[, 1:2])
+```
+
